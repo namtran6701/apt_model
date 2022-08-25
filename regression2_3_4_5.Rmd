@@ -1,14 +1,36 @@
 ---
-title: "Regression 2, Regression 3, and Regression 4 "
+title: "Regression 2, Regression 3, Regression 4, Regression 5 "
 author: "Nam Tran"
 date: "2022-08-08"
 output: word_document
 ---
 
+The project is demonstrate the correlation between <market return, sector return, adjusted market return and adjusted sector return> and the stock individual returns. Insights from this developing model could be used to build arbitrage pricing models, hedging strategies, etc.
+
+- Stocks are selected from the S&P 500, with full historical data during the period of 2016-2021. 
+
+- Stock data are obtained from CRSP, Wharton Research Data Services.
+
+
 Import some necessary package for the project
 
 ```{r}
-pacman::p_load(pacman, tidyverse, magrittr, psych, skimr, zoo, data.table, sqldf, parallel, plyr, lubridate, broom, car, tictoc)
+pacman::p_load(
+  pacman,
+  tidyverse,
+  magrittr,
+  psych,
+  skimr,
+  zoo,
+  data.table,
+  sqldf,
+  parallel,
+  plyr,
+  lubridate,
+  broom,
+  car,
+  tictoc
+)
 ```
 
 Import the data
@@ -80,8 +102,9 @@ df %<>% mutate(PERMNO = as.factor(PERMNO))
 ```{r}
 estimation <- df %>% filter(year %in% c(2016, 2017, 2018))
 ```
+# Regression 2: dual beta model
 
-# Run the Dual Beta Regression
+- Dual beta regression takes into account the effect of market premium and sector premium on the individual stock's return
 
 -   fit_stat 1 will include the alphas, betas, and their corresponding p values
 
@@ -310,9 +333,11 @@ est_output_modified %>% ggplot(aes(x = Sector,  y = Reg2_VF1))+
   ylab("Variance Inflation Factor")
 ```
 
-# Run a Regression with Beta 2 as explanatory variable only
+# Regression 3: 
 
--   fit_stat 3 will include the alphas, betas, and their corresponding p values
+-  Regression with Sector premium as explanatory variables only
+
+- fit_stat 3 will include the alphas, betas, and their corresponding p values
 
 ```{r}
 
@@ -511,9 +536,6 @@ sector_mktcap_data<- sqldf("SELECT *,
       sum(Sector_MKTCAP) over(partition by date) as total_mktcap
       from sector_data") %>% as.tibble()
 ```
-
-
-
 
 
 1. Exclude financials sector
@@ -1011,7 +1033,10 @@ data_reg5 %<>% mutate(mkt_adj_sector_ret = as.numeric(mkt_adj_sector_ret),
 
 ```
 
-# Run Regression 5
+# Regression 5
+
+- In this model, we take into account the effect of adjusted return of sector premium and market premium. 
+- Adjusted sector premium is the return of sector excluding the return of the individual stock. Adj market premium is the return of market excluding the return of the given sector. 
 
 ```{r}
 # reg5_fit1 contains coefficients of alpha, beta1, and beta2 
@@ -1099,7 +1124,7 @@ est_output_model5 <- sqldf('SELECT e.*, f.`adj.r.squared` as Reg5_ARS
                             on e.PERMNO = f.PERMNO')
 ```
 
-Compute VIFs
+Compute Variance Inflation Factors
 
 ```{r}
 vif_reg5 <- data_reg5 %>% 
@@ -1121,7 +1146,7 @@ vif_reg5 %<>%
   select(PERMNO, Reg5_VF1, Reg5_VF2)
 ```
 
-Join all output together
+Join all outputs together
 
 ```{r}
 est_output_model5 <- inner_join(est_output_model5, vif_reg5, by = 'PERMNO')
