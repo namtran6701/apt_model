@@ -1,0 +1,2231 @@
+---
+title: "All Models Except Model 1 "
+author: "Nam Tran"
+date: "`r Sys.Date()`"
+output: word_document
+---
+
+The project is demonstrate the correlation between \<market return, sector return, adjusted market return and adjusted sector return\> and the stock individual returns. - Stocks are selected from the S&P 500, with full historical data during the period of 2016-2021. - Stock data are obtained from CRSP, Wharton Research Data Services.
+
+Import some necessary package for the project
+
+```{r}
+pacman::p_load(
+  pacman,
+  tidyverse,
+  magrittr,
+  psych,
+  skimr,
+  zoo,
+  data.table,
+  sqldf,
+  parallel,
+  plyr,
+  lubridate,
+  broom,
+  car,
+  tictoc, 
+  corrplot,
+  esquisse
+)
+options(scipen = 999)
+```
+
+Import the data
+
+```{r}
+df <- read.csv("stock_data3.csv", stringsAsFactors = T) %>% as_tibble()
+```
+
+```{r}
+
+df %<>% select(-X)
+
+```
+
+Rearrange Column Headers
+
+```{r}
+df %<>%
+  select(date,
+         PERMNO,
+         TICKER,
+         COMNAM,
+         Sector,
+         PRC,
+         MKT_CAP,
+         SHROUT,
+         ind_ret,
+         EFFR,
+         mkret)
+```
+
+Create some columns to facilitate the dual beta model
+
+```{r}
+# Create a daiy market cap
+df <- sqldf("SELECT *,
+      sum(MKT_CAP) over(partition by date, Sector) as Sector_MKTCAP
+      FROM df
+      ") %>% as_tibble()
+
+# Create a market_cap share column, which is show the market cap proportion of each individual's stock in a Sector
+# Create a Return_Weighted variable, which is the daily weighted return of a stock in a sector.
+
+df %<>% mutate(MKTCAP_SHARE = MKT_CAP/Sector_MKTCAP, # Market cap Percent Of individual stock in an Sector
+               Return_Weighted = ind_ret * MKTCAP_SHARE) 
+
+# Create a Daily_Sector_Return
+df <- sqldf("SELECT *, 
+      sum(Return_Weighted) over(partition by date, Sector) as Daily_Sector_Return 
+      FROM df")
+
+# format the date variable and create a year column
+
+df %<>% mutate(date = ymd(date),
+               year = year(date))
+
+# Most important variables 
+
+df %<>% mutate(excess_ret = ind_ret - EFFR,
+               mket_prem = mkret - EFFR,
+               sector_prem = Daily_Sector_Return - EFFR
+               )
+df %<>% mutate(PERMNO = as.factor(PERMNO)) 
+```
+
+-   Create an estimation dataset, from beginning 2016 to end 2018
+
+```{r}
+estimation <- df %>% filter(year %in% c(2016, 2017, 2018))
+```
+
+# Regression 2
+
+-   Dual beta regression takes into account the effect of market premium and sector premium on the individual stock's return
+
+-   fit_stat 1 will include the alphas, betas, and their corresponding p values
+
+```{r}
+
+fit_stat1 <- estimation %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret~mket_prem + sector_prem, data=.)),
+         tidied = map(model, tidy)) %>% 
+  unnest(tidied)
+
+```
+
+-   fit_stat2 will include the model's adjusted R squared and its p value
+
+```{r}
+fit_stat2 <- estimation %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data,~lm(excess_ret ~ mket_prem + sector_prem, data =.)),
+         tidied = map(model, glance)) %>% 
+  unnest(tidied)
+```
+
+-   Round the output and remove some unnecessary columns
+
+```{r}
+fit_stat1 %<>% 
+  mutate_if(is.numeric, round, digits = 4)
+fit_stat1 %<>% 
+  select(-c(data, model, std.error, statistic)) 
+```
+
+```{r}
+fit_stat2 %<>% mutate_if(is.numeric, round, digits = 4)
+fit_stat2 %<>% select(PERMNO, adj.r.squared, p.value)
+```
+
+Join two outputs together
+
+```{r}
+est_output <- join(fit_stat1, fit_stat2, by = "PERMNO")
+est_output[,6] <- NULL #Remove the Null column
+```
+
+*Plot Statistic outputs*
+
+```{r}
+est_output %>% ggplot() +
+  geom_density(aes(x = estimate, col = term), data = est_output) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Reg2_B0","Reg2_B1", "Reg2_B2")) + 
+  theme(panel.background = element_blank()) +
+  xlab("Coefficient") + 
+  ylab("Density") +
+  ggtitle("Regression 2: Distribution of Coefficients from 2016 - 2018")
+```
+
+```{r}
+est_output %>% ggplot() +
+  geom_density(aes(x = p.value, col = term), data = est_output) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Reg2_B0","Reg2_B1", "Reg2_B2")) + 
+  theme(panel.background = element_blank()) +
+  xlab("P-Value") + 
+  ylab("Density") +
+  ggtitle("Regression 2: Distribution of Coefficient's P-Value from 2016-2018")
+```
+
+```{r}
+est_output %>% ggplot() +
+  geom_point(aes(y= p.value, x = PERMNO, col = term), data = est_output, alpha = 0.8) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Alpha","Beta", "Sector Premium")) + 
+  theme(panel.background = element_blank(),
+        legend.key = element_blank()) +
+  xlab("PERMNO") + 
+  ylab("P-Value") +
+  ggtitle("Dual Beta Model Distribution of Coefficient's P-Value")
+```
+
+```{r}
+est_output %<>% mutate(Alpha = NA,
+                      Beta = NA,
+                      Sector_Prem = NA) 
+
+# Fill variable Alpha
+
+for (i in 3:nrow(est_output)){
+  est_output$Alpha[i] = with(est_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1] & PERMNO[i] == PERMNO[i-2],
+                                    estimate[i-2], NA))}
+
+# Fill variable Beta
+
+for (i in 3:nrow(est_output)){
+  est_output$Beta[i] = with(est_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1] & PERMNO[i] == PERMNO[i-2],
+                                    estimate[i-1], NA))
+}
+
+# Fill variable Sector_Prem
+
+for (i in 3:nrow(est_output)){
+  est_output$Sector_Prem[i] = with(est_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1] & PERMNO[i] == PERMNO[i-2],
+                                    estimate[i], NA))
+}
+
+est_output %<>% mutate(Alpha_pval = NA,
+                      Beta_pval = NA, 
+                      Sector_Prem_pval = NA)
+
+# Fill variable Sector_Prem_pval 
+
+for (i in 3:nrow(est_output)){
+  est_output$Sector_Prem_pval[i] = with(est_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1] & PERMNO[i] == PERMNO[i-2],
+                                    p.value[i], NA))}
+
+# Fill variable Beta_pval 
+
+for (i in 3:nrow(est_output)){
+  est_output$Beta_pval[i] = with(est_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1] & PERMNO[i] == PERMNO[i-2],
+                                    p.value[i-1], NA))}
+  
+# Fill variable Alpha_pval
+
+for (i in 3:nrow(est_output)){
+  est_output$Alpha_pval[i] = with(est_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1] & PERMNO[i] == PERMNO[i-2],
+                                    p.value[i-2], NA))}
+
+```
+
+*Remove some columns and rows*
+
+```{r}
+est_output %<>% 
+  filter(term == "sector_prem") %>% 
+  select(-c(term, estimate, p.value)) %>% 
+  dplyr::rename( 
+      Reg2_ARS = adj.r.squared, 
+      Reg2_B0 = Alpha,
+      Reg2_B1 = Beta,
+      Reg2_B2 = Sector_Prem,
+      Reg2_P1 = Beta_pval,
+      Reg2_P0 = Alpha_pval,
+      Reg2_P2 = Sector_Prem_pval
+)
+
+```
+
+Join this output with the Basic capm output to get the tickers and sector
+
+```{r}
+dt <- read.csv("modified_output.csv")
+est_output <- sqldf("SELECT e.*, d.tic, d.Sector
+      FROM est_output as e
+      JOIN dt as d
+      ON e.PERMNO = d.PERMNO") %>% as_tibble() %>% 
+  select(PERMNO, tic, Sector, everything()) 
+```
+
+Export the output
+
+```{r}
+write.csv(est_output, "est_output2.csv")
+```
+
+# Additional Information Request
+
+-   Distribution of R squared, its average value and standard deviation
+
+```{r}
+est_output %>% 
+  ggplot(aes(x = Reg2_ARS))+
+  geom_density() + 
+  xlab("Adjusted R Squared") +
+  ggtitle("Regression 2: Adjusted R-Squared Distribution from 2016 to 2018") + 
+  theme(panel.background = element_blank())
+```
+
+*Average value and standard deviation of Adjusted R Squared*
+
+```{r}
+output_stat <- est_output %>% 
+  skim() %>% 
+  mutate_if(is.numeric, round, digits = 4) %>% 
+  filter(skim_variable != "PERMNO")
+
+output_stat %<>% select(-c(n_missing, complete_rate))
+output_stat
+
+est_output %>% 
+  describe() %>% 
+  select(mean, sd)
+```
+
+**Run the VIFs for each of the two parameters**
+
+```{r}
+var_inf <- estimation %>% 
+  nest(data=-PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)),
+        vf_stat = map(model,vif)) %>% 
+  unnest(vf_stat)
+
+vector_name <- rep(c("Reg2_VF1","Reg2_VF2"), 357)
+
+# Bind vector_name and var_inf together
+
+var_inf <- tibble(cbind(var_inf, vector_name))
+
+# Remove columns and modify column name
+
+var_inf %<>% 
+  spread(key = vector_name, value = vf_stat) %>% 
+  mutate(PERMNO = as.factor(PERMNO)) %>% 
+  select(PERMNO, Reg2_VF1, Reg2_VF2)
+var_inf
+```
+
+```{r}
+est_output_modified <- sqldf("SELECT e.*, v.Reg2_VF1,v.Reg2_VF2
+                             FROM est_output as e
+                             JOIN var_inf as v
+                             ON e.PERMNO = v.PERMNO") %>% as.tibble()
+additional_stat_reg2 <- (est_output_modified %>% describe() %>% select(mean, sd))[-c(1:3),] 
+write.csv(additional_stat_reg2, 'additional_stat_reg2.csv')
+```
+
+```{r}
+est_output_modified %<>% mutate(PERMNO = as.factor(PERMNO),
+                               Sector = as.factor(Sector))
+
+
+est_output_modified %>% ggplot(aes(x = Sector,  y = Reg2_VF1))+
+  geom_boxplot() +
+  coord_flip() + 
+  ggtitle("Regression 2: Variance Inflation Factor of Sectors") +
+  ylab("Variance Inflation Factor")+ 
+  theme(panel.background = element_blank())
+
+```
+
+# Regression 3:
+
+-   Regression with Sector premium as an explanatory variable only
+
+-   fit_stat 3 will include the alphas, betas, and their corresponding p values
+
+```{r}
+
+fit_stat3 <- estimation %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ sector_prem, data=.)),
+         tidied = map(model, tidy)) %>% 
+  unnest(tidied)
+
+```
+
+-   fit_stat 4 will include the model's adjusted R squared and its p value
+
+```{r}
+
+fit_stat4 <- estimation %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data,~lm(excess_ret ~ sector_prem, data =.)),
+         tidied = map(model, glance)) %>% 
+  unnest(tidied)
+
+```
+
+-   Round the output by 4 decimal places and remove some unnecessary columns
+
+```{r}
+fit_stat3 %<>% mutate_if(is.numeric, round, digits = 4)
+fit_stat3 %<>% select(-c(data, model, std.error, statistic)) 
+```
+
+```{r}
+fit_stat4 %<>% mutate_if(is.numeric, round, digits = 4)
+fit_stat4 %<>% select(PERMNO, adj.r.squared, p.value)
+```
+
+Join two outputs together
+
+```{r}
+est_output3 <- join(fit_stat3, fit_stat4, by = "PERMNO")
+est_output3[,6] <- NULL #Remove the Null column
+```
+
+*Plot Statistic outputs*
+
+```{r}
+est_output3 %>% 
+  ggplot() +
+  geom_density(aes(x = estimate, col = term), data = est_output3) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Reg3_B0","Reg3_B2")) + 
+  theme(panel.background = element_blank()) +
+  xlab("Coefficient") + 
+  ylab("Density") +
+  ggtitle("Regression 3: Distribution of Coefficients from 2016 to 2018")
+```
+
+```{r}
+est_output3 %>% ggplot() +
+  geom_density(aes(x = p.value, col = term), data = est_output3) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Reg3_B0","Reg3_B2")) + 
+  theme(panel.background = element_blank()) +
+  xlab("P-Value") + 
+  ylab("Density") +
+  ggtitle("Regression 3: Distribution of Coefficient's P-Value from 2016 to 2018")+
+  ylim(c(0,15))
+```
+
+```{r}
+est_output3 %>% ggplot() +
+  geom_point(aes(y= p.value, x = PERMNO, col = term), data = est_output3, alpha = 0.8) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Alpha","Beta2")) + 
+  theme(panel.background = element_blank(),
+        legend.key = element_blank()) +
+  xlab("PERMNO") + 
+  ylab("P-Value") +
+  ggtitle("Beta2 Model Distribution of Coefficient's P-Value")
+```
+
+Modified table output
+
+```{r}
+est_output3 %<>% mutate(Alpha = NA, 
+                       Beta2 = NA, 
+                       Alpha_pval = NA,
+                       Beta2_pval = NA,
+                       PERMNO = as.factor(PERMNO)) %>% as.tibble()
+
+# Fill variable Alpha 
+for (i in 2:nrow(est_output3)){
+  est_output3$Alpha[i] = with(est_output3,ifelse(PERMNO[i]==PERMNO[i-1], estimate[i-1], NA))
+}
+
+# Fill variable Beta
+
+for (i in 2:nrow(est_output3)){
+  est_output3$Beta2[i] = with(est_output3,
+                             ifelse(PERMNO[i] == PERMNO[i-1],
+                                    estimate[i], NA))
+}
+
+# Fill variable Beta2_pval 
+
+for (i in 2:nrow(est_output3)){
+  est_output3$Beta2_pval[i] = with(est_output3,
+                             ifelse(PERMNO[i] == PERMNO[i-1],
+                                    p.value[i], NA))}
+  
+# Fill variable Alpha_pval
+
+for (i in 2:nrow(est_output3)){
+  est_output3$Alpha_pval[i] = with(est_output3,
+                             ifelse(PERMNO[i] == PERMNO[i-1],
+                                    p.value[i-1], NA))}
+
+
+est_output3 %<>% 
+  filter(term != "(Intercept)") %>% 
+  select(-c(term, estimate, p.value))
+
+# Rename some columns and rows
+
+est_output3 %<>% 
+  dplyr::rename( 
+      Reg3_ARS = adj.r.squared, 
+      Reg3_B0 = Alpha,
+      Reg3_B2 = Beta2,
+      Reg3_P0 = Alpha_pval,
+      Reg3_P2 = Beta2_pval)
+
+
+```
+
+*Plot adjusted R squared*
+
+```{r}
+est_output3 %>% 
+  ggplot(aes(x = Reg3_ARS))+
+  geom_density() + 
+  xlab("Adjusted R Squared") +
+  ggtitle("Regression 3: Adjusted R Squared Distribution from 2016 to 2018")+ 
+  theme(panel.background = element_blank())
+```
+
+```{r}
+est_output3 %>% 
+  skim() %>% 
+  select(-c(n_missing, complete_rate)) %>% 
+  mutate_if(is.numeric, round, digits = 4)
+```
+
+Export the file
+
+```{r}
+est_output3 <- sqldf("SELECT e.*, m.Sector, m.tic
+                     FROM est_output3 as e
+                     JOIN est_output as m
+                     ON e.PERMNO = m.PERMNO") %>% as.tibble()
+est_output3 %<>% select(PERMNO, tic, Sector, everything())
+write.csv(est_output3,"beta2_model.csv")
+```
+
+# Regression 4
+
+```{r}
+reg4 <- estimation %>% dplyr::rename(
+  stock_mktcap = MKT_CAP,
+  weighted_stock = MKTCAP_SHARE,
+  weighted_return_stock = Return_Weighted,
+) %>%
+  select(
+    date,
+    year,
+    PERMNO,
+    TICKER,
+    COMNAM,
+    Sector,
+    PRC,
+    SHROUT,
+    stock_mktcap,
+    Sector_MKTCAP,
+    ind_ret,
+    EFFR,
+    weighted_stock,
+    weighted_return_stock,
+    Daily_Sector_Return,
+    excess_ret
+  ) %>% as.tibble()
+```
+
+Daily Market Cap of each Sector
+
+```{r}
+sector_data <- reg4 %>% select(date, Sector,Sector_MKTCAP, Daily_Sector_Return) %>% unique() 
+```
+
+```{r}
+# Create daily market cap data for all sector 
+sector_mktcap_data<- sqldf("SELECT *, 
+      sum(Sector_MKTCAP) over(partition by date) as total_mktcap
+      from sector_data") %>% as.tibble()
+```
+
+1.  Exclude financials sector
+
+```{r}
+# # Create daily market cap data for all sector
+# 
+# sector_mktcap_data <- sqldf("SELECT *,
+#       sum(Sector_MKTCAP) over(partition by date) as total_mktcap
+#       from sector_data") %>% as.tibble()
+# 
+# # Calculate the weight of each sector and the adjusted sector return based on the adjusted market cap
+# 
+# sector_ret_weighted <-
+#   sqldf(
+#     "select *, sum(Sector_MKTCAP) over (partition by date) as adj_mktcap
+#       from adj_mktcap_data"
+#   ) %T>%  as.tibble() %>% mutate(
+#     sector_weight = Sector_MKTCAP / adj_mktcap,
+#     sector_ret_weighted = Daily_Sector_Return * sector_weight
+#   )
+# 
+# # Calculate the adjusted market return
+# mkt_weighted_ret <-
+#   sqldf(
+#     "select *, sum(sector_ret_weighted) over (partition by date) as adj_mkt_ret
+# from sector_ret_weighted"
+#   )
+# # Join with the stock data
+# 
+# adjusted_mkt_data <- sqldf(
+#   "select r.*,m.adj_mkt_ret
+#       from reg4 as r
+#       join mkt_weighted_ret as m
+#       on r.date = m.date
+#       and r.Sector = m.Sector"
+# ) %T>% as.tibble() %>% mutate(mket_prem = adj_mkt_ret - EFFR)
+# 
+# adjusted_mkt_data %>% nest(data = -PERMNO) %>% mutate(model = map(data, ~
+#                                                                     lm(excess_ret ~ mket_prem, data = .)),
+#                                                       tidied = map(model, tidy)) %>%
+#   unnest(tidied)
+# 
+# adjusted_mkt_data %>% nest(data = -PERMNO) %>% mutate(model = map(data, ~
+#                                                                     lm(excess_ret ~ mket_prem, data = .)),
+#                                                       tidied = map(model, glance)) %>%
+#   unnest(tidied)
+```
+
+Create a vector of all sectors to be used later
+
+```{r}
+sector_vector <-c(
+    "Financials",
+    "Industrials",
+    "Consumer Discretionary",
+    "Information Technology",
+    "Health Care",
+    "Consumer Staples",
+    "Utilities",
+    "Materials",
+    "Real Estate",
+    "Energy",
+    "Consumer Services")
+```
+
+```{r}
+tic("Time consumed: ")
+for (i in sector_vector) {
+  adj_mktcap_data <-
+    sector_mktcap_data %>%  filter(Sector != i)
+  
+  # Calculate the weight of each sector and the adjusted sector return based on the adjusted market cap
+  sector_ret_weighted <-
+    sqldf(
+      "select *, sum(Sector_MKTCAP) over (partition by date) as adj_mktcap
+      from adj_mktcap_data"
+    ) %T>%  as.tibble() %>% mutate(
+      sector_weight = Sector_MKTCAP / adj_mktcap,
+      sector_ret_weighted = Daily_Sector_Return * sector_weight
+    )
+  
+  # Calculate the adjusted market return
+  mkt_weighted_ret <-
+    sqldf(
+      "select *, sum(sector_ret_weighted) over (partition by date) as adj_mkt_ret
+from sector_ret_weighted"
+    )
+  
+  # Join with the stock data
+  
+  adjusted_mkt_data <- sqldf(
+    "select r.*,m.adj_mkt_ret
+      from reg4 as r
+      join mkt_weighted_ret as m
+      on r.date = m.date
+      and r.Sector = m.Sector"
+  ) %T>% as.tibble() %>% mutate(mket_prem = adj_mkt_ret - EFFR)
+  
+  # Create name of vector to store function
+  fit_stat1_reg4 <-
+    adjusted_mkt_data %>% nest(data = -PERMNO) %>% mutate(model = map(data, ~
+                                                                        lm(excess_ret ~ mket_prem, data = .)),
+                                                          tidied = map(model, tidy)) %>%
+    unnest(tidied)
+  
+  assign(paste0("fit_stat1_exclude_", i), fit_stat1_reg4)
+  
+  fit_stat2_reg4 <-
+    adjusted_mkt_data %>% nest(data = -PERMNO) %>% mutate(model = map(data, ~
+                                                                        lm(excess_ret ~ mket_prem, data = .)),
+                                                          tidied = map(model, glance)) %>%
+    unnest(tidied)
+  
+  assign(paste0("fit_stat2_exclude_", i), fit_stat2_reg4)
+  
+}
+
+toc()
+
+```
+
+Now gather the the output
+
+```{r}
+# Gather output for stat1 first
+
+## Create a function to filter only necessary output from stat1 
+stat1_filter <- function(input){
+  input %<>%
+    select(PERMNO, term, estimate, p.value) %>% 
+    mutate_if(is.numeric, round, digits = 4)
+  return(input)
+}
+
+#1
+fit_stat1_exclude_Consumer_Discretionary <- stat1_filter(`fit_stat1_exclude_Consumer Discretionary`)
+
+#2 
+
+fit_stat1_exclude_Consumer_Services <- stat1_filter(`fit_stat1_exclude_Consumer Services`)
+
+#3
+
+fit_stat1_exclude_Consumer_Staples <- stat1_filter(`fit_stat1_exclude_Consumer Staples`)
+
+#4
+
+fit_stat1_exclude_Energy <- stat1_filter(`fit_stat1_exclude_Health Care`)
+
+#5
+
+fit_stat1_exclude_Health_Care <- stat1_filter(`fit_stat1_exclude_Health Care`)
+
+#6
+
+fit_stat1_exclude_Financials <- stat1_filter(fit_stat1_exclude_Financials)
+
+#7
+
+fit_stat1_exclude_Industrials <- stat1_filter(fit_stat1_exclude_Industrials)
+
+#8
+
+fit_stat1_exclude_Information_Technology <- stat1_filter(`fit_stat1_exclude_Information Technology`)
+
+#9
+
+fit_stat1_exclude_Real_Estate <- stat1_filter(`fit_stat1_exclude_Real Estate`)
+
+#10
+
+fit_stat1_exclude_Materials <- stat1_filter(fit_stat1_exclude_Materials)
+
+#11
+
+fit_stat1_exclude_Utilities <- stat1_filter(fit_stat1_exclude_Utilities)
+
+```
+
+```{r}
+# Gather output for stat2
+
+stat2_filter <- function(input){
+  input %<>% 
+    select(PERMNO, Reg4_ARS = adj.r.squared) %>% 
+    mutate_if(is.numeric, round, digits = 4)
+  return(input)
+}
+
+#1
+fit_stat2_exclude_Consumer_Discretionary <- stat2_filter(`fit_stat2_exclude_Consumer Discretionary`)
+
+#2 
+
+fit_stat2_exclude_Consumer_Services <- stat2_filter(`fit_stat2_exclude_Consumer Services`)
+
+#3
+
+fit_stat2_exclude_Consumer_Staples <- stat2_filter(`fit_stat2_exclude_Consumer Staples`)
+
+#4
+
+fit_stat2_exclude_Energy <- stat2_filter(`fit_stat2_exclude_Health Care`)
+
+#5
+
+fit_stat2_exclude_Health_Care <- stat2_filter(`fit_stat2_exclude_Health Care`)
+
+#6
+
+fit_stat2_exclude_Financials <- stat2_filter(fit_stat2_exclude_Financials)
+
+#7
+
+fit_stat2_exclude_Industrials <- stat2_filter(fit_stat2_exclude_Industrials)
+
+#8
+
+fit_stat2_exclude_Information_Technology <- stat2_filter(`fit_stat2_exclude_Information Technology`)
+
+#9
+
+fit_stat2_exclude_Real_Estate <- stat2_filter(`fit_stat2_exclude_Real Estate`)
+
+#10
+
+fit_stat2_exclude_Materials <- stat2_filter(fit_stat2_exclude_Materials)
+
+#11
+
+fit_stat2_exclude_Utilities <- stat2_filter(fit_stat2_exclude_Utilities)
+
+```
+
+Restructure fit_stat1
+
+```{r}
+restructure <- function(input){
+  input %<>% mutate(Reg4_B0 = NA,
+                   Reg4_B1 = NA,
+                   Reg4_P1 = NA,
+                   Reg4_P0 = NA)
+  for (i in 2:nrow(input)){
+    input$Reg4_B0[i] <- with(input, ifelse(PERMNO[i] == PERMNO[i-1], estimate[i-1], NA))
+    input$Reg4_B1[i] <- with(input, ifelse(PERMNO[i] == PERMNO[i-1], estimate[i], NA))
+    input$Reg4_P0[i] <- with(input, ifelse(PERMNO[i] == PERMNO[i-1], p.value[i-1], NA))
+    input$Reg4_P1[i] <- with(input, ifelse(PERMNO[i] == PERMNO[i-1], p.value[i], NA))
+  }
+  input %<>% filter(term != "(Intercept)") %>% select(PERMNO, Reg4_B0, Reg4_B1, Reg4_P0, Reg4_P1)
+  
+  return(input)
+}
+```
+
+Restructure fit_stat2
+
+```{r}
+#1
+mk_excluded_consumer_discretionary <- join(fit_stat1_exclude_Consumer_Discretionary, fit_stat2_exclude_Consumer_Discretionary, by = "PERMNO")
+
+#2
+mk_excluded_consumer_service <- join(fit_stat1_exclude_Consumer_Services, fit_stat2_exclude_Consumer_Services, by = "PERMNO")
+
+#3
+mk_excluded_staples <- join(fit_stat1_exclude_Consumer_Staples, fit_stat2_exclude_Consumer_Staples, by = "PERMNO")
+
+#4
+mk_excluded_health_care<- join(fit_stat1_exclude_Health_Care, fit_stat2_exclude_Health_Care, by = "PERMNO")
+
+#5
+mk_excluded_financials <- join(fit_stat1_exclude_Financials, fit_stat2_exclude_Financials, by = "PERMNO")
+
+#6
+mk_excluded_consumer_industrials <- join(fit_stat1_exclude_Industrials, fit_stat2_exclude_Industrials, by = "PERMNO")
+
+#7
+mk_excluded_information_tech <- join(fit_stat1_exclude_Information_Technology, fit_stat2_exclude_Information_Technology, by = "PERMNO")
+
+#8
+mk_excluded_real_estate <- join(fit_stat1_exclude_Real_Estate, fit_stat2_exclude_Real_Estate, by = "PERMNO")
+
+#9
+mk_excluded_utilities <- join(fit_stat1_exclude_Utilities, fit_stat2_exclude_Utilities, by = "PERMNO")
+
+#10
+mk_excluded_materials <- join(fit_stat1_exclude_Materials, fit_stat2_exclude_Materials, by = "PERMNO")
+
+#11
+mk_excluded_energy<- join(fit_stat1_exclude_Energy, fit_stat2_exclude_Energy, by = "PERMNO")
+
+```
+
+join with the previous output to include tic and Sector
+
+```{r}
+#Create a loop 
+
+output_list <- list(mk_excluded_consumer_discretionary = mk_excluded_consumer_discretionary, 
+                    mk_excluded_consumer_industrials = mk_excluded_consumer_industrials,
+                    mk_excluded_consumer_service = mk_excluded_consumer_service,
+                    mk_excluded_energy = mk_excluded_energy,
+                    mk_excluded_financials = mk_excluded_financials,
+                    mk_excluded_health_care = mk_excluded_health_care,
+                    mk_excluded_information_tech = mk_excluded_information_tech,
+                    mk_excluded_materials = mk_excluded_materials,
+                    mk_excluded_real_estate = mk_excluded_real_estate,
+                    mk_excluded_staples = mk_excluded_staples,
+                    mk_excluded_utilities = mk_excluded_utilities)
+
+name_list <-  c("mk_excluded_consumer_discretionary", 
+                    "mk_excluded_industrials",
+                    "mk_excluded_consumer_service",
+                    "mk_excluded_energy",
+                    "mk_excluded_financials",
+                    "mk_excluded_health_care",
+                    "mk_excluded_information_tech",
+                    "mk_excluded_materials",
+                    "mk_excluded_real_estate",
+                    "mk_excluded_staples",
+                    "mk_excluded_utilities")
+
+
+suplement_tic <- function(input) {
+  input %<>% join(est_output3 %>% select(PERMNO, tic, Sector), by = "PERMNO") %>%        select(PERMNO, tic, Sector, everything())
+  return(input)
+}
+
+for (i in 1:length(output_list)){
+  a <- suplement_tic(output_list[[i]]) 
+  assign(name_list[i], a)
+}
+
+```
+
+# Create requested statistic
+
+```{r}
+for (i in 1:length(output_list)){
+  a <- output_list[[i]] %>% describe() %>%
+    select(n, mean, sd, min, max, kurtosis, se) %>% 
+    mutate_if(is.numeric, round, digits = 4)
+  assign(paste0("additional_stat_",name_list[i]), a)
+}
+```
+
+# Regression 5
+
+-   In this model, we take into account the effect of adjusted return of sector premium and market premium. Adjusted sector premium is the return of sector excluding the return of the individual stock. Adj market premium is the return of market excluding the return of the given sector.
+
+```{r}
+# Calculate the daily adjusted return for the market for each sector 
+
+x <- sector_ret_weighted
+x$new_ret_adj <- NA
+x <- x %>% mutate(ret_x_mktcap = Daily_Sector_Return * Sector_MKTCAP)
+for (i in 1:nrow(x)) {
+  x$new_ret_adj[i] <-
+    (1 / (x$total_mktcap[i] - x$Sector_MKTCAP[i])) * (
+      x %>% filter(Sector != Sector[i] &
+                     date == date[i]) %>% dplyr::group_by(date) %>%
+        dplyr::summarize(adj_mkt_ret = sum(ret_x_mktcap))
+    )[1, 'adj_mkt_ret']
+}
+
+```
+
+```{r}
+# Calculate the adjusted return of the sector for each stock 
+## cmt these out to avoid long time processing
+
+# y = adjusted_mkt_data
+# 
+# y$new_ind_ret_adj <- NA
+# 
+# tic("time consumed")
+# for (i in 1:nrow(y)){
+#   y$new_ind_ret_adj[i] <- 
+#     (1/(y$Sector_MKTCAP[i] - y$stock_mktcap[i]))*(y %>% 
+#                                                     filter(TICKER != TICKER[i] & date == date[i] & Sector == Sector[i]) %>% 
+#                                                     mutate(ind_ret_x_mktcap = 
+#                                                              ind_ret*stock_mktcap) %>% 
+#                                                     dplyr::group_by(date) %>% 
+#                                                     dplyr::summarize(adj_stock_ret = sum(ind_ret_x_mktcap)))[1,'adj_stock_ret']
+# }
+# toc()
+# 
+# y$new_ind_ret_adj <- as.numeric(y$new_ind_ret_adj)
+# x$new_ret_adj <- as.numeric(x$new_ret_adj)
+# 
+# 
+# write.csv(y, 'reg5_data.csv')
+
+```
+
+Join data x with y to to add sector adjusted return for x
+
+```{r}
+y <- read.csv('reg5_data.csv', stringsAsFactors = T) %>% as.tibble()
+
+y %<>% mutate(date = ymd(date))
+
+x2 <- x %>% select(date, Sector, mkt_adj_sector_ret = new_ret_adj)
+
+
+
+data_reg5 <-
+  inner_join(x2, y, by = c('date', 'Sector')) %>% select(
+    date,
+    Sector,
+    PERMNO,
+    tic = TICKER,
+    mkt_adj_sector_ret,
+    sector_adj_ret = new_ind_ret_adj,
+    effr = EFFR,
+    excess_ret
+  )
+
+data_reg5 %<>% mutate(mkt_adj_sector_ret = as.numeric(mkt_adj_sector_ret),
+                      mket_prem = mkt_adj_sector_ret - effr,
+                     sector_prem = sector_adj_ret - effr)
+data_reg5 %>% head(100)
+```
+
+```{r}
+# reg5_fit1 contains coefficients of alpha, beta1, and beta2 
+reg5_fit1 <- data_reg5 %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)), 
+      tidied = map(model, tidy)) %>% 
+ unnest(tidied)
+
+# reg5_fit2 contains the model' p-values
+reg5_fit2 <- data_reg5 %>% nest(data = -PERMNO) %>% 
+  mutate(
+ model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)), 
+      tidied = map(model, glance)) %>% 
+ unnest(tidied)
+```
+
+Summarize output
+
+```{r}
+# round outputs by 4 decimal places
+round_output <- function(input){
+  input %<>% mutate_if(is.numeric, round, digits = 4)
+  return(input)
+}
+reg5_fit1 <- round_output(reg5_fit1)
+reg5_fit2 <- round_output(reg5_fit2)
+
+# remove unnecessary columns and join 2 stats together
+
+reg5_fit1 %<>% select(PERMNO, term, estimate, p.value_fit1 = p.value)
+
+reg5_fit2 %<>% select(PERMNO, adj.r.squared)
+
+est_output_model5 <- inner_join(reg5_fit1, reg5_fit2, by = 'PERMNO')
+
+# Reformat the table 
+
+est_output_model5 %<>% mutate(Reg3_B0 = NA, 
+                       Reg3_P0 = NA, 
+                       Reg3_B1 = NA,
+                       Reg3_P1 = NA,
+                       Reg3_B2 = NA,
+                       Reg3_P2 = NA) %>%
+                      as.tibble()
+```
+
+Reformat output table
+
+```{r}
+g <- est_output_model5$PERMNO
+
+for (i in 2:(nrow(est_output_model5)-1)){
+  for (j in 6:11){
+    if ((g[i] == g[i-1]) & (g[i] == g[i+1])){
+      if (j == 6) {
+        est_output_model5[i,j] = est_output_model5$estimate[i-1]
+      } else if (j == 7){
+        est_output_model5[i,j] = est_output_model5$p.value_fit1[i-1]
+      } else if (j == 8) {
+        est_output_model5[i,j] = est_output_model5$estimate[i]
+      } else if (j == 9) {
+        est_output_model5[i,j] = est_output_model5$p.value_fit1[i]
+      } else if (j == 10) {
+        est_output_model5[i,j] = est_output_model5$estimate[i+1]
+      } else if (j == 11) {
+        est_output_model5[i,j] = est_output_model5$p.value_fit1[i+1]
+      }
+      else {
+        NA
+      }
+    }
+  }
+}
+
+est_output_model5 %<>% 
+  filter(complete.cases(.)) %>% 
+  select(-c(term, estimate, p.value_fit1, adj.r.squared))
+
+est_output_model5 %<>% mutate(PERMNO = as.factor(PERMNO))
+
+# Join with fit 2 to include adjusted r squared
+
+est_output_model5 <- sqldf('SELECT e.*, f.`adj.r.squared` as Reg3_ARS
+                            FROM est_output_model5 as e 
+                            JOIN reg5_fit2 as f
+                            on e.PERMNO = f.PERMNO')
+```
+
+Compute VIFs
+
+```{r}
+vif_reg5 <- data_reg5 %>% 
+  nest(data=-PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)),
+        vf_stat = map(model,vif)) %>% 
+  unnest(vf_stat)
+
+# Bind vector_name and vif_reg5 together
+vector_name2 <- rep(c('Reg3_VF1', 'Reg3_VF2'), 357)
+
+vif_reg5 <- tibble(cbind(vif_reg5, vector_name2))
+
+# Remove columns and modify column name
+
+vif_reg5 %<>% 
+  spread(key = vector_name2, value = vf_stat) %>% 
+  mutate(PERMNO = as.factor(PERMNO)) %>% 
+  select(PERMNO, Reg3_VF1, Reg3_VF2)
+
+
+
+
+```
+
+Join all outputs together
+
+```{r}
+est_output_model5 <- inner_join(est_output_model5, vif_reg5, by = 'PERMNO')
+
+est_output_model5 %<>% mutate_if(is.numeric, round, digits = 4)
+
+est_output_model5 %<>% 
+  suplement_tic()
+additional_stat_reg5 <- (est_output_model5 %>% 
+                           describe() %>% 
+                           select(mean, sd, skew,kurtosis))[c(-1:-3),]
+
+
+```
+
+
+Export regression 5 output
+
+```{r}
+write.csv(est_output_model5, 'model3_old.csv')
+
+```
+
+Visualization for Regression 5
+
+```{r}
+est_output_model5 %>% 
+  gather(key = 'Variable',
+         value = 'Coefficient',
+         -c(PERMNO, tic, Sector,Reg3_P0, Reg3_P1,Reg3_P2, Reg3_ARS,Reg3_VF1, Reg3_VF2)) %>% 
+  arrange(PERMNO) %>% 
+  ggplot(aes(x = Coefficient, color = Variable)) + 
+  geom_density() + 
+  theme(panel.background = element_blank()) + 
+  xlab('Coefficient') +
+  ggtitle('Model 3: Distribution of Coefficients from 2016 to 2018')
+
+est_output_model5 %>% 
+  ggplot(aes(x = Reg3_ARS)) + 
+  geom_density()+ 
+  theme(panel.background = element_blank()) + 
+  xlab('Adjusted R-Squared') +
+  ylab('density')+
+  ggtitle('Model 3: Adjusted R Squared Distribution from 2016 to 2018') +
+  annotate('text', label = 'Average: 0.4242', x =0.515, y =1) +
+  geom_vline(xintercept = 0.4242)
+```
+
+Regression 4.2
+
+-   Adjusted return as coefficient for beta1
+
+```{r}
+tic('Time consumed')
+x <- sector_ret_weighted
+x$new_ret_adj <- NA
+x <- x %>% mutate(ret_x_mktcap = Daily_Sector_Return * Sector_MKTCAP)
+for (i in 1:nrow(x)) {
+  x$new_ret_adj[i] <-
+    (1 / (x$total_mktcap[i] - x$Sector_MKTCAP[i])) * (
+      x %>% filter(Sector != Sector[i] &
+                     date == date[i]) %>% dplyr::group_by(date) %>%
+        dplyr::summarize(adj_mkt_ret = sum(ret_x_mktcap))
+    )[1, 'adj_mkt_ret']
+}
+toc()
+
+# convert column type to numeric. It is currently in list type
+x %<>% mutate(new_ret_adj = as.numeric(new_ret_adj))
+
+```
+
+The new_ret_adj in data x is the market adjusted return. Join x with reg4 to add this column into reg4 data. Stock in the same sector will have the same market adj return
+
+```{r}
+data_reg4 <- sqldf('SELECT reg4.*, x.new_ret_adj as mkt_adj_sector_ret
+      from reg4 
+      join x
+      on 
+      reg4.date = x.date 
+      and 
+      reg4.Sector = x.Sector') %>% select(
+    date,
+    Sector,
+    PERMNO,
+    tic = TICKER,
+    mkt_adj_sector_ret,
+    effr = EFFR,
+    excess_ret
+  ) %>% mutate(mket_prem = mkt_adj_sector_ret - effr)
+
+
+```
+
+Perform the building model step
+
+```{r}
+# reg4_fit1 contains alpha, and coefficient of mket_prem, coefficient's pval
+reg4_fit1 <- data_reg4 %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem, data =.)),
+         tidied = map(model, tidy)) %>% 
+  unnest(tidied) %>% select(PERMNO, term, estimate,p.value) %>% mutate_if(is.numeric, round, digits = 4)
+
+# reg4_fit2 contains adjusted R square of the model only 
+reg4_fit2 <- data_reg4 %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret~mket_prem, data =.)),
+         glanced = map(model, glance)) %>% 
+  unnest(glanced) %>% 
+  select(PERMNO, Reg4_ARS = adj.r.squared) %>% 
+  mutate_if(is.numeric, round, digits = 4)
+```
+
+Format the ouputs
+
+```{r}
+reg4_fit1 <- restructure(reg4_fit1)
+est_output_model4 <- inner_join(reg4_fit1, reg4_fit2, by = 'PERMNO')
+
+#Add ticker and sector 
+est_output_model4 <- suplement_tic(est_output_model4)
+write.csv(est_output_model4,'reg4_output.csv') 
+
+# Change name to meet new demand
+est_output_model4 %<>% 
+  transmute(PERMNO = PERMNO,
+            tic = tic,
+            Sector = Sector,
+            Reg2_B0 = Reg4_B0,
+            Reg2_B1 = Reg4_B1,
+            Reg2_P0 = Reg4_P0,
+            Reg2_P1 = Reg4_P1,
+            Reg2_ARS = Reg4_ARS)
+  
+```
+
+Visualization
+
+```{r}
+
+# Distribution of Coefficients
+est_output_model4 %>% 
+  gather(key = 'Variable',
+         value = 'Return',
+         -c(PERMNO,tic,Sector, Reg2_P0, Reg2_P1, Reg2_ARS)) %>% 
+  ggplot(aes(x = Return, color = Variable)) + 
+  geom_density() + 
+  theme(panel.background = element_blank()) + 
+  xlab('Coefficient') +
+  ggtitle('Model 2: Distribution of Coefficients from 2016 to 2018')
+
+# Distribution of R-squared
+est_output_model4 %>% 
+  ggplot(aes(x = Reg2_ARS)) + 
+  geom_density() + 
+  theme(panel.background = element_blank()) + 
+  xlab('Adjusted R-Squared') +
+  ylab('density')+
+  ggtitle('Model 2: Adjusted R Squared Distribution from 2016 to 2018') +
+  annotate('text', label = 'Average: 0.2561', x = 0.31, y = 1.5)+
+  geom_vline(xintercept = 0.2561)
+
+```
+
+Summarize the output
+
+```{r}
+additional_stat_reg4 <- (est_output_model4 %>% describe() %>% select(mean, median, sd,skew, kurtosis))[-1,]
+
+additional_stat_reg4[-c(1,2),]
+```
+Export model 4
+```{r}
+write.csv(est_output_model4, 'model2_old.csv')
+```
+
+calculate correlation matrix
+
+```{r}
+sector_ret_matrix <- sector_mktcap_data %>% select(-c(Sector_MKTCAP, total_mktcap)) %>% spread(key = Sector, value = Daily_Sector_Return)
+mkret_matrix <- estimation %>% select(date, mkret) %>% unique()
+correlation_matrix <- inner_join(sector_ret_matrix, mkret_matrix, by = 'date')
+correlation_matrix1 <- correlation_matrix %>% select(-date) %>% cor() 
+write.csv(correlation_matrix,'corr_matrix.csv')
+sector_ret_matrix %>% view()
+
+
+```
+
+matrix 2
+
+```{r}
+daily_adj_mkt_ret <- data_reg5 %>% select(date, Sector, mkt_adj_sector_ret)
+corr_matrix_data <- join(sector_data, daily_adj_mkt_ret, by = c('date', 'Sector')) %>% select(-Sector_MKTCAP)
+
+```
+
+```{r}
+sector_vector <- sector_vector[-11]
+sector_vector[11] <- 'Communication Services'
+for (i in sector_vector){
+  a <-corr_matrix_data %>% 
+    filter(Sector == i) %$% cor(Daily_Sector_Return, mkt_adj_sector_ret)
+  assign(paste('cor_', i,'_mk'), a)
+}
+
+sector_ret_matrix %<>% select(-date) %>% cor() 
+corr_sector_vs_market <- tibble(market = rbind(`cor_ Communication Services _mk`, `cor_ Consumer Discretionary _mk`, `cor_ Consumer Staples _mk`, `cor_ Energy _mk`, `cor_ Financials _mk`, `cor_ Health Care _mk`, `cor_ Industrials _mk`, `cor_ Information Technology _mk`, `cor_ Materials _mk`, `cor_ Real Estate _mk`, `cor_ Utilities _mk`))
+
+cor_matrix <- cbind(sector_ret_matrix, market= corr_sector_vs_market)
+vector_corr_sector_vs_market <- t(corr_sector_vs_market)
+vector_corr_sector_vs_market[12] <- 1
+cor_matrix <- rbind(cor_matrix, market= vector_corr_sector_vs_market) 
+correlation_matrix_final <- rownames_to_column(cor_matrix, var = "Correlation Matrix")
+correlation_matrix_final %<>% mutate_if(is.numeric, round, digits = 4)
+write.csv(correlation_matrix_final,'corr_matrix.csv')
+```
+
+# Testing set
+
+-   [**Run model 2**]{.underline} on the data set from 2019 to end 2021
+
+```{r}
+
+# Create a sample from 2019 to 2021 from df
+
+reg_2_test <- df %>% 
+              filter(year(date) %in% c(2019, 2020, 2021))
+```
+
+-   [Run the model]{.underline}
+
+```{r}
+
+# reg2_test_fit1 would contain p value of each coefficients
+reg2_test_fit1 <- reg_2_test %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model= map(data,~lm(excess_ret ~ mket_prem + sector_prem, data=.)),
+         tidied = map(model, tidy)) %>% 
+  unnest(tidied)
+
+reg2_test_fit1
+
+
+# reg2_test_fit1 would contain 
+reg2_test_fit2 <- reg_2_test %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model= map(data,~lm(excess_ret ~ mket_prem + sector_prem, data=.)),
+         glanced= map(model, glance)) %>% 
+  unnest(glanced)
+
+
+```
+
+[Visualization data]{.underline}
+
+```{r}
+reg2_test_fit1 %>% 
+  ggplot() +
+  geom_density(aes(x = estimate, col = term), data = reg2_test_fit1) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Reg2_B0","Reg2_B1", "Reg2_B2")) + 
+  theme(panel.background = element_blank()) +
+  xlab("Coefficient") + 
+  ylab("Density") +
+  ggtitle("Regression 2: Distribution of Coefficients from 2019 to 2021")
+
+```
+
+```{r}
+reg2_test_fit1 %>% ggplot() +
+  geom_density(aes(x = p.value, col = term), data = reg2_test_fit1) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Alpha","Beta", "Sector Premium")) + 
+  theme(panel.background = element_blank()) +
+  xlab("P-Value") + 
+  ylab("Density") +
+  ggtitle("Regresion 2: Distribution of Coefficient's P-Value from 2019 to 2021") + 
+  ylim(c(0,15))
+```
+
+-   Restructure
+
+```{r}
+
+reg2_test_stat1 <- reg2_test_fit1 %>% 
+                  stat1_filter()
+
+reg2_test_stat2 <- reg2_test_fit2 %>% 
+                  stat2_filter()
+
+reg2_test_stat1 %<>% mutate(Reg2_B0 = NA,
+                      Reg2_B1 = NA,
+                      Reg2_B2 = NA) 
+
+for (i in 3:nrow(reg2_test_stat1)) {
+  reg2_test_stat1$Reg2_B0[i] = with(reg2_test_stat1,
+                                  ifelse(PERMNO[i] == PERMNO[i - 1] &
+                                           PERMNO[i] == PERMNO[i - 2],
+                                         estimate[i - 2], NA))
+}
+
+# Fill variable Beta
+
+for (i in 3:nrow(reg2_test_stat1)) {
+  reg2_test_stat1$Reg2_B1[i] = with(reg2_test_stat1,
+                                 ifelse(PERMNO[i] == PERMNO[i - 1] &
+                                          PERMNO[i] == PERMNO[i - 2],
+                                        estimate[i - 1], NA))
+}
+
+# Fill variable Sector_Prem
+
+for (i in 3:nrow(reg2_test_stat1)) {
+  reg2_test_stat1$Reg2_B2[i] = with(reg2_test_stat1,
+                                        ifelse(PERMNO[i] == PERMNO[i - 1] &
+                                                 PERMNO[i] == PERMNO[i - 2],
+                                               estimate[i], NA))
+}
+
+reg2_test_stat1 %<>% mutate(
+  Reg2_P0 = NA,
+  Reg2_P1 = NA,
+  Reg2_P2 = NA
+)
+
+# Fill variable Sector_Prem_pval
+
+for (i in 3:nrow(reg2_test_stat1)) {
+  reg2_test_stat1$Reg2_P2[i] = with(reg2_test_stat1,
+                                             ifelse(PERMNO[i] == PERMNO[i - 1] &
+                                                      PERMNO[i] == PERMNO[i - 2],
+                                                    p.value[i], NA))
+}
+
+# Fill variable Beta_pval
+
+for (i in 3:nrow(reg2_test_stat1)) {
+  reg2_test_stat1$Reg2_P1[i] = with(reg2_test_stat1,
+                                      ifelse(PERMNO[i] == PERMNO[i - 1] &
+                                               PERMNO[i] == PERMNO[i - 2],
+                                             p.value[i - 1], NA))
+}
+
+# Fill variable Alpha_pval
+
+for (i in 3:nrow(reg2_test_stat1)) {
+  reg2_test_stat1$Reg2_P0[i] = with(reg2_test_stat1,
+                                       ifelse(PERMNO[i] == PERMNO[i - 1] &
+                                                PERMNO[i] == PERMNO[i - 2],
+                                              p.value[i - 2], NA))
+}
+
+# Remove unncessary columns 
+
+reg2_test_stat1 %<>%
+  filter(complete.cases(.)) %>% 
+  select(-c(term:p.value))
+
+# join with stat1 
+
+reg2_test_stat2 <- dplyr::rename(reg2_test_stat2,Reg2_ARS = Reg4_ARS)
+
+reg2_output <- plyr::join(reg2_test_stat1, reg2_test_stat2, by = 'PERMNO')
+
+```
+
+Run VIF for regression 2
+
+```{r}
+reg2_test_vif <- reg_2_test %>% 
+  nest(data=-PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)),
+        vf_stat = map(model,vif)) %>% 
+  unnest(vf_stat)
+
+# Bind vector_name and reg2_test_vif together
+
+var_inf <- tibble(cbind(reg2_test_vif, vector_name))
+
+# Remove columns and modify column name
+
+var_inf %<>% 
+  spread(key = vector_name, value = vf_stat) %>% 
+  mutate(PERMNO = as.factor(PERMNO)) %>% 
+  select(PERMNO, Reg2_VF1, Reg2_VF2)
+var_inf
+
+# Join with the output
+
+reg2_output <- join(reg2_output, var_inf, by = 'PERMNO')
+
+reg2_output %<>% suplement_tic()
+
+```
+
+Finish visualization for model 2
+
+```{r}
+reg2_test_stat2 %>% ggplot(aes(x = Reg2_ARS)) + 
+  geom_density() + 
+  ggtitle('Regresion 2: Adjusted R-Squared Distribution from 2019 to 2021 ')+ 
+  theme(panel.background = element_blank()) +
+  xlab('Adjusted R Squared')
+
+
+```
+
+```{r}
+reg2_output %>% ggplot(aes(x = Sector,  y = Reg2_VF1))+
+  geom_boxplot() +
+  coord_flip() + 
+  ggtitle(" Reg_2 Variance Inflation Factor of Sectors 2019-2021") +
+  ylab("Variance Inflation Factor")+ 
+  theme(panel.background = element_blank())
+```
+
+Export outputs
+
+```{r}
+write.csv(reg2_output,'test_reg2.csv')
+
+reg2_output %>% skim() %>% mutate_if(is.numeric, round, digits = 4)
+reg2_test_summary_stat <- reg2_output %>% 
+  select(Reg2_B0:Reg2_VF2) %>%
+  colMeans() %>% enframe() %>% 
+  transmute(Coefficient = name, 
+            Value = value) %>% 
+  mutate_if(is.numeric, round, digits = 4)
+
+write.csv(reg2_test_summary_stat,'reg2_test_stat.csv')
+
+```
+
+[**Regression 3**]{.underline} on the dataset 2019 - 2021
+
+```{r}
+reg_3_test <-
+  df %>% 
+  filter(year(date) %in% c(2019, 2020, 2021))
+```
+
+**Run the regression 3**
+
+```{r}
+reg3_test_fit1 <-
+  reg_3_test %>%
+  nest(data = -PERMNO) %>%
+  mutate(model = map(data, ~ lm(excess_ret ~ sector_prem, data = .)),
+         tidied = map(model, tidy)) %>%
+  unnest(tidied)
+
+
+reg3_test_fit2 <-
+  reg_3_test %>%
+  nest(data = -PERMNO) %>%
+  mutate(model = map(data, ~ lm(excess_ret ~ sector_prem, data = .)),
+         glanced = map(model, glance)) %>%
+  unnest(glanced)
+
+```
+
+```{r}
+
+reg3_test_fit1%<>% select(-c(data, model, std.error, statistic)) 
+reg3_test_fit2 %<>% select(PERMNO, adj.r.squared)
+reg3_output <- join(reg3_test_fit1, reg3_test_fit2, by = "PERMNO")
+
+
+```
+
+Visualize the output
+
+*Coefficients plots*
+
+```{r}
+reg3_output %>% 
+  ggplot() +
+  geom_density(aes(x = estimate, col = term), data = reg3_output) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Reg3_B0","Reg3_B2")) + 
+  theme(panel.background = element_blank()) +
+  xlab("Coefficient") + 
+  ylab("Density") +
+  ggtitle("Regression 3: Distribution of Coefficients from 2019 to 2021")
+```
+
+*P-value distribution*
+
+```{r}
+reg3_output %>% ggplot() +
+  geom_density(aes(x = p.value, col = term), data = reg3_output) + 
+  scale_color_discrete(guide = guide_legend(title = "Variable"), labels = c("Reg3_P0","Reg3_P2")) + 
+  theme(panel.background = element_blank()) +
+  xlab("P-Value") + 
+  ylab("Density") +
+  ggtitle("Regression 3: P-Value Distribution from 2019 to 2021") +
+  ylim(0,2.5)
+
+
+```
+
+Restructure the output dataset
+
+```{r}
+
+reg3_output %<>% mutate(Reg3_B0 = NA, 
+                        Reg3_B2 = NA, 
+                        Reg3_P0 = NA,
+                        Reg3_P2= NA,
+                       PERMNO = as.factor(PERMNO)) %>% as.tibble()
+
+# Fill variable Alpha 
+for (i in 2:nrow(reg3_output)){
+  reg3_output$Reg3_B0[i] = with(reg3_output,ifelse(PERMNO[i]==PERMNO[i-1], estimate[i-1], NA))
+}
+
+# Fill variable Beta2
+
+for (i in 2:nrow(reg3_output)){
+  reg3_output$Reg3_B2[i] = with(reg3_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1],
+                                    estimate[i], NA))
+}
+
+# Fill variable Beta2_pval 
+
+for (i in 2:nrow(reg3_output)){
+  reg3_output$Reg3_P2[i] = with(reg3_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1],
+                                    p.value[i], NA))}
+  
+# Fill variable Alpha_pval
+
+for (i in 2:nrow(reg3_output)){
+  reg3_output$Reg3_P0[i] = with(reg3_output,
+                             ifelse(PERMNO[i] == PERMNO[i-1],
+                                    p.value[i-1], NA))}
+
+
+reg3_output %<>% 
+  filter(term != "(Intercept)") %>% 
+  select(-c(term, estimate, p.value))
+
+reg3_output %<>% 
+  mutate(Reg3_ARS =adj.r.squared) %>% 
+  select(-adj.r.squared)
+
+# Add tickers and sector 
+reg3_output %<>% suplement_tic()
+```
+
+Visualize adjusted R squared
+
+```{r}
+reg3_output %>% 
+  ggplot(aes(x = Reg3_ARS))+
+  geom_density() + 
+  xlab("Adjusted R Squared") +
+  ggtitle("Regression 3: Adjusted R Squared Distribution from 2019 to 2021")+ 
+  theme(panel.background = element_blank())
+```
+
+**Export output for regression 3**
+
+```{r}
+
+reg3_output %<>% mutate_if(is.numeric, round, digits = 4) %>% view()
+reg3_output %>% skim() %>% mutate_if(is.numeric, round, digits = 4)
+write.csv(reg3_output, 'reg3_output.csv')
+```
+
+[**Regression 4:**]{.underline}
+
+-   Market returns excludes the corresponding sector's return.
+
+```{r}
+reg_4_test <- 
+  df %>% 
+  filter(year(date) %in% c(2019,2020,2021))
+```
+
+```{r}
+# Create a sector vector 
+sector_vector <-c(
+    "Financials",
+    "Industrials",
+    "Consumer Discretionary",
+    "Information Technology",
+    "Health Care",
+    "Consumer Staples",
+    "Utilities",
+    "Materials",
+    "Real Estate",
+    "Energy",
+    "Communication Services")
+```
+
+```{r}
+
+sector_data <- reg_4_test %>% 
+  select(date, 
+         Sector,
+         Sector_MKTCAP, 
+         Daily_Sector_Return) %>% 
+  unique() 
+ 
+sector_mktcap_data<- sqldf("SELECT *, 
+      sum(Sector_MKTCAP) over(partition by date) as total_mktcap
+      from sector_data") %>%
+  as.tibble()
+
+# Calculate the weight of each sector and the adjusted sector return based on the adjusted market cap
+
+sector_ret_weighted <-
+    sqldf(
+      "select *, sum(Sector_MKTCAP) over (partition by date) as adj_mktcap
+      from sector_mktcap_data"
+    ) %T>%  as.tibble() %>% mutate(
+      sector_weight = Sector_MKTCAP / adj_mktcap,
+      sector_ret_weighted = Daily_Sector_Return * sector_weight
+    )
+
+reg4_sector_data <- sector_ret_weighted
+
+reg4_sector_data$new_ret_adj <- NA
+
+reg4_sector_data <- 
+  reg4_sector_data %>% 
+  mutate(ret_x_mktcap = Daily_Sector_Return * Sector_MKTCAP)
+
+for (i in 1:nrow(reg4_sector_data)) {
+  reg4_sector_data$new_ret_adj[i] <-
+    (1 / (reg4_sector_data$total_mktcap[i] - reg4_sector_data$Sector_MKTCAP[i])) * (
+      reg4_sector_data %>% filter(Sector != Sector[i] &
+                     date == date[i]) %>% dplyr::group_by(date) %>%
+        dplyr::summarize(adj_mkt_ret = sum(ret_x_mktcap))
+    )[1, 'adj_mkt_ret']
+}
+
+reg4_sector_data %<>% 
+  mutate(new_ret_adj = as.numeric(new_ret_adj))
+
+
+```
+
+The new_ret_adj in data x is the market adjusted return. Join x with reg4 to add this column into reg4 data. Stock in the same sector will have the same market adj return.
+
+```{r}
+
+reg4_test <- sqldf('SELECT reg4.*, x.new_ret_adj as mkt_adj_sector_ret
+      from reg_4_test as reg4
+      join reg4_sector_data as x
+      on 
+      reg4.date = x.date 
+      and 
+      reg4.Sector = x.Sector') %>% select(
+    date,
+    Sector,
+    PERMNO,
+    tic = TICKER,
+    mkt_adj_sector_ret,
+    effr = EFFR,
+    excess_ret
+  ) %>%
+  mutate(
+    mket_prem = mkt_adj_sector_ret - effr)
+
+```
+
+```{r}
+# reg4_fit1 contains alpha, and coefficient of mket_prem, coefficient's pval
+reg4_test_fit1 <- reg4_test %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem, data =.)),
+         tidied = map(model, tidy)) %>% 
+  unnest(tidied) %>% select(PERMNO, term, estimate,p.value) %>% 
+  mutate_if(is.numeric, round, digits = 4)
+
+# reg4_test_fit2 contains adjusted R square of the model only 
+reg4_test_fit2 <- reg4_test %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret~mket_prem, data =.)),
+         glanced = map(model, glance)) %>% 
+  unnest(glanced) %>% 
+  select(PERMNO, Reg4_ARS = adj.r.squared) %>% 
+  mutate_if(is.numeric, round, digits = 4)
+```
+
+```{r}
+reg4_test_fit2 %>% 
+  ggplot(aes(x = Reg4_ARS)) +
+  geom_density() + 
+  ggtitle('Model 2: Adjusted R-Squared Distribution from 2019 to 2021')+ 
+  theme(panel.background = element_blank()) +
+  xlab('Adjusted R Squared') +
+  ylab('density')+
+  annotate('text', label = 'Average: 0.3958', x= .46, y =1.5) +
+  geom_vline(xintercept = 0.3958)
+
+reg4_test_fit1 %>% 
+  ggplot(aes(x = estimate, color = term)) + 
+  geom_density() + 
+  guides(color = guide_legend(title = 'Variable')) + 
+  scale_color_discrete( labels = c('Reg2_B0','Reg2_B1')) + 
+  xlab('Coefficient') +
+  ggtitle('Model 2: Distribution of Coefficients from 2019 to 2021') + 
+  theme(panel.background = element_blank())
+```
+
+[Extract statistics for model 4]{.underline}
+
+```{r}
+
+est_test_model4 <-  restructure(reg4_test_fit1) %>% 
+  mutate(Reg4_ARS = reg4_test_fit2$Reg4_ARS)
+
+est_test_model4 %>% 
+  skim %>% 
+  select(-c(n_missing, complete_rate)) %>% 
+  mutate_if(is.numeric, round, digits = 4)
+
+est_output_model4 %<>% 
+  transmute(PERMNO = PERMNO,
+            tic = tic,
+            Sector = Sector,
+            Reg2_B0 = Reg4_B0,
+            Reg2_B1 = Reg4_B1,
+            Reg2_P0 = Reg4_P0,
+            Reg2_P1 = Reg4_P1,
+            Reg2_ARS = Reg4_ARS)
+
+write.csv(est_output_model4,'model2_new_test.csv')
+```
+
+```{r}
+daily_adj_mkt_ret <-
+  reg4_test %>%
+  select(date, Sector, mkt_adj_sector_ret)
+
+corr_matrix_data <-
+  join(sector_data, daily_adj_mkt_ret, by = c('date', 'Sector')) %>% 
+  select(-Sector_MKTCAP)
+
+corr_matrix_data$Sector <- fct_recode(corr_matrix_data$Sector, 'Communication Services' = 'Commucation Services')
+
+for (i in sector_vector){
+  a <-corr_matrix_data %>% 
+    filter(Sector == i) %$% cor(Daily_Sector_Return, mkt_adj_sector_ret)
+  assign(paste0('cor_', i,'_mk'), a)
+}
+
+sector_ret_matrix <-
+  sector_mktcap_data %>% 
+  select(-c(Sector_MKTCAP, total_mktcap)) %>% 
+  spread(key = Sector, value = Daily_Sector_Return)
+
+sector_ret_matrix %<>% 
+  select(-date) %>% cor()
+
+corr_sector_vs_market <-
+  data.frame(
+    Market = rbind(
+      `cor_Communication Services_mk`,
+      `cor_Consumer Discretionary_mk`,
+      `cor_Consumer Staples_mk`,
+      `cor_Energy_mk`,
+      `cor_Financials_mk`,
+      `cor_Health Care_mk`,
+      `cor_Industrials_mk`,
+      `cor_Information Technology_mk`,
+      `cor_Materials_mk`,
+      `cor_Real Estate_mk`,
+      `cor_Utilities_mk`
+    )
+  )
+
+cor_matrix <-
+  cbind(sector_ret_matrix, Market = corr_sector_vs_market)
+
+vector_corr_sector_vs_market <- t(corr_sector_vs_market)
+
+vector_corr_sector_vs_market[12] <- 1
+
+cor_matrix <-
+  rbind(cor_matrix, Market = vector_corr_sector_vs_market)
+
+cor_matrix %>% view()
+
+
+(cor_matrix %<>% mutate_if(is.numeric, round, digits = 4)) %>% view()
+
+write.csv(cor_matrix, 'cor_matrix2.csv')
+```
+
+```{r}
+mk_performance_plot <- df %>% 
+  distinct(date,mkret)  
+
+write.csv(mk_performance_plot, 'mk_performance_plot.csv')
+
+```
+
+```{r}
+df %>% 
+  filter(year(date) %in% c(2016:2018)) %>% 
+  ggplot() +
+  geom_line(aes(x = date, y = mkret)) + 
+  ylab('Market Return') + 
+  xlab('Date') + 
+  ylim(c(-10,10))+ 
+  theme(panel.background = element_blank())+ 
+  ggtitle('Market Performance from 2016 to 2018')
+```
+
+```{r}
+df %>% 
+  filter(year(date) %in% c(2019:2021)) %>% 
+  ggplot() +
+  geom_line(aes(x = date, y = mkret)) + 
+  ylab('Market Return') + 
+  xlab('Date') + 
+  theme(panel.background = element_blank()) +
+  ggtitle('Market Performance from 2019 to 2021')
+
+```
+
+```{r}
+pacman::p_load(quantmod, ggthemes, esquisse)
+```
+
+[**Extract data from the S&P 500**]{.underline}
+
+```{r}
+
+getSymbols('^GSPC',
+           from = as.Date('2016-01-01'),
+           to = as.Date(Sys.Date()))
+
+```
+
+Get the adjusted price only
+
+```{r}
+gspc <- Ad(GSPC)
+```
+
+```{r}
+gspc <- data.frame(gspc) 
+
+names(gspc) <- c('S&P 500 Price')
+gspc <- rownames_to_column(gspc, var = 'date')
+
+gspc %<>% 
+  mutate(date = ymd(date))
+
+
+gspc %>% 
+  filter(year(date) %in% c(2016:2018)) %>% 
+  select(2) %>% 
+  describe()
+
+gspc %>% 
+  filter(year(date) %in% c(2019:2021)) %>% 
+  select(2) %>% 
+  describe()
+```
+
+```{r}
+gspc %>%
+ filter(date >= "2019-01-01" & date <= "2021-12-30") %>%
+ ggplot() +
+ aes(x = date, y = `S&P 500 Price`) +
+ geom_line(size = 0.65, colour = "#112446") +
+ labs(x = "Date", 
+ y = "Index", title = "S&P 500 Index From 2019 to 2021") +
+
+ylim(c(2000,5000))+ 
+  theme(panel.background = element_blank())
+```
+
+```{r}
+gspc %>%
+ filter(date >= "2016-01-04" & date <= "2018-12-31") %>%
+ ggplot() +
+ aes(x = date, y = `S&P 500 Price`) +
+ geom_line(size = 0.65, colour = "#112446") +
+ labs(x = "Date", 
+ y = "Index", title = "S&P 500 Index From 2016 to 2018") + 
+  theme(panel.background = element_blank())
+```
+
+```{r}
+gspc %>%
+ filter(date >= "2022-01-01") %>%
+ ggplot() +
+ aes(x = date, y = `S&P 500 Price`) +
+ geom_line(size = 0.65, colour = "#112446") +
+ labs(x = "Date", 
+ y = "Index", title = "S&P 500 Index from 2022 to Oct 2022") + 
+  theme(panel.background = element_blank())
+```
+
+```{r}
+tic('Time consumed')
+x <- sector_ret_weighted
+x$new_ret_adj <- NA
+x <- x %>% mutate(ret_x_mktcap = Daily_Sector_Return * Sector_MKTCAP)
+for (i in 1:nrow(x)) {
+  x$new_ret_adj[i] <-
+    (1 / (x$total_mktcap[i] - x$Sector_MKTCAP[i])) * (
+      x %>% filter(Sector != Sector[i] &
+                     date == date[i]) %>% dplyr::group_by(date) %>%
+        dplyr::summarize(adj_mkt_ret = sum(ret_x_mktcap))
+    )[1, 'adj_mkt_ret']
+}
+toc()
+
+# convert column type to numeric. It is currently in list type
+x %<>% mutate(new_ret_adj = as.numeric(new_ret_adj))
+
+
+```
+
+```{r}
+# Calculate the adjusted return of the sector for each stock
+## cmt these out to avoid long time processing
+# y = reg_4_test
+# 
+# y$new_ind_ret_adj <- NA
+# 
+# for (i in 1:nrow(y)){
+#   y$new_ind_ret_adj[i] <-
+#     (1/(y$Sector_MKTCAP[i] - y$MKT_CAP[i]))*(y %>%
+#                                                     filter(TICKER != TICKER[i] & date == date[i] & Sector == Sector[i]) %>%
+#                                                     mutate(ind_ret_x_mktcap =
+#                                                              ind_ret*MKT_CAP) %>%
+#                                                     dplyr::group_by(date) %>%
+#                                                     dplyr::summarize(adj_stock_ret = sum(ind_ret_x_mktcap)))[1,'adj_stock_ret']
+# }
+# 
+# y$new_ind_ret_adj <- as.numeric(y$new_ind_ret_adj)
+
+
+# write.csv(y, 'reg5_period2_data.csv')
+```
+
+After executing the long query, export the output. The output we just calculated is the sector exclude individual stock return
+
+```{r}
+y2 <- read.csv("reg5_period2_data.csv", stringsAsFactors = T) %>% 
+  as_tibble()
+y2 %<>% 
+  mutate(date = ymd(date))
+
+x2 <-
+  x %>%
+  select(date, 
+         Sector, 
+         mkt_adj_sector_ret = new_ret_adj)
+
+
+y2 %>% head(1000) %>% view()
+data_test_reg5 <-
+  inner_join(x2, y2, by = c('date', 'Sector')) %>% select(
+    date,
+    Sector,
+    PERMNO,
+    tic = TICKER,
+    mkt_adj_sector_ret,
+    sector_adj_ret = new_ind_ret_adj,
+    effr = EFFR,
+    excess_ret
+  )
+
+data_test_reg5 %<>% mutate(mkt_adj_sector_ret = as.numeric(mkt_adj_sector_ret),
+                      mket_prem = mkt_adj_sector_ret - effr,
+                     sector_prem = sector_adj_ret - effr)
+
+
+data_test_reg5 %>% head(1000) %>% view()
+```
+
+Running the model
+
+```{r}
+# reg5_fit1 contains coefficients of alpha, beta1, and beta2 
+reg5_test_fit1 <- data_test_reg5 %>% 
+  nest(data = -PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)), 
+      tidied = map(model, tidy)) %>% 
+ unnest(tidied)
+
+# reg5_fit2 contains the model' p-values
+reg5_test_fit2 <- data_test_reg5 %>% nest(data = -PERMNO) %>% 
+  mutate(
+ model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)), 
+      tidied = map(model, glance)) %>% 
+ unnest(tidied)
+```
+
+```{r}
+# round outputs by 4 decimal places
+# 
+reg5_test_fit1 <- round_output(reg5_test_fit1)
+reg5__test_fit2 <- round_output(reg5_test_fit2)
+
+# remove unnecessary columns and join 2 stats together
+
+reg5_test_fit1 %<>% select(PERMNO, term, estimate, p.value_fit1 = p.value)
+
+reg5_test_fit2 %<>% select(PERMNO, adj.r.squared)
+
+est_test_model5 <- inner_join(reg5_test_fit1, reg5_test_fit2, by = 'PERMNO')
+
+# Reformat the table 
+# From here, change reg5 to reg3
+est_test_model5 %<>% mutate(Reg3_B0 = NA, 
+                       Reg3_P0 = NA, 
+                       Reg3_B1 = NA,
+                       Reg3_P1 = NA,
+                       Reg3_B2 = NA,
+                       Reg3_P2 = NA) %>%
+                      as_tibble()
+
+
+```
+
+```{r}
+g <- est_test_model5$PERMNO
+
+for (i in 2:(nrow(est_test_model5)-1)){
+  for (j in 6:11){
+    if ((g[i] == g[i-1]) & (g[i] == g[i+1])){
+      if (j == 6) {
+        est_test_model5[i,j] = est_test_model5$estimate[i-1]
+      } else if (j == 7){
+        est_test_model5[i,j] = est_test_model5$p.value_fit1[i-1]
+      } else if (j == 8) {
+        est_test_model5[i,j] = est_test_model5$estimate[i]
+      } else if (j == 9) {
+        est_test_model5[i,j] = est_test_model5$p.value_fit1[i]
+      } else if (j == 10) {
+        est_test_model5[i,j] = est_test_model5$estimate[i+1]
+      } else if (j == 11) {
+        est_test_model5[i,j] = est_test_model5$p.value_fit1[i+1]
+      }
+      else {
+        NA
+      }
+    }
+  }
+}
+
+est_test_model5 %<>% 
+  filter(complete.cases(.)) %>% 
+  select(-c(term, estimate, p.value_fit1, adj.r.squared))
+
+est_test_model5 %<>% 
+  mutate(PERMNO = as.factor(PERMNO))
+
+# Join with fit 2 to include adjusted r squared
+
+est_test_model5 <- sqldf('SELECT e.*, f.`adj.r.squared` as Reg3_ARS
+                            FROM est_test_model5 as e 
+                            JOIN reg5_test_fit2 as f
+                            on e.PERMNO = f.PERMNO')
+
+```
+
+```{r}
+
+# Visualizing 
+est_test_model5 %>% 
+  gather(key = 'Variable',
+         value = 'Coefficient',
+         -c(PERMNO,Reg3_P0, Reg3_P1,Reg3_P2, Reg3_ARS)) %>% 
+  arrange(PERMNO) %>% 
+  ggplot(aes(x = Coefficient, color = Variable)) + 
+  geom_density() + 
+  theme(panel.background = element_blank()) + 
+  xlab('Coefficient') +
+  ggtitle('Model 3: Distribution of Coefficients from 2019 to 2021')
+
+est_test_model5 %>% 
+  ggplot(aes(x = Reg3_ARS)) + 
+  geom_density()+ 
+  theme(panel.background = element_blank()) + 
+  xlab('Adjusted R-Squared') +
+  ylab('density')+
+  ggtitle('Model 3: Adjusted R Squared Distribution from 2019 to 2021') +
+  annotate('text', label = 'Average: 0.5382', x = 0.62, y=1)+
+  geom_vline(xintercept = 0.54)
+```
+
+[**Statistics for model 5**]{.underline}
+
+```{r}
+est_test_model5 %>%
+ skim() %>% 
+  select(-c(n_missing, complete_rate)) %>% 
+  mutate_if(is.numeric, round, digits = 4) 
+```
+
+```{r}
+reg5_test_vif <- data_test_reg5 %>% 
+  nest(data=-PERMNO) %>% 
+  mutate(model = map(data, ~lm(excess_ret ~ mket_prem + sector_prem, data =.)),
+        vf_stat = map(model,vif)) %>% 
+  unnest(vf_stat)
+
+# Bind vector_name and reg5_test_vif together
+
+var_inf_reg5 <- tibble(cbind(reg5_test_vif, vector_name))
+
+# Remove columns and modify column name
+
+var_inf_reg5 %<>% 
+  spread(key = vector_name, value = vf_stat) %>% 
+  mutate(PERMNO = as.factor(PERMNO)) %>% 
+  select(PERMNO, Reg2_VF1, Reg2_VF2) %>% 
+  mutate(Reg3_VF1= Reg2_VF1,
+         Reg3_VF2 = Reg2_VF2) %>% 
+  select(-c(Reg2_VF1, Reg2_VF2))
+# Join with the output
+
+reg5_test_output <- join(est_test_model5, var_inf_reg5, by = 'PERMNO')
+reg5_test_output %<>% suplement_tic()
+
+reg5_test_output %>% skim()
+
+
+
+
+(reg5_test_output %>% 
+  describe() %>% 
+  select(mean, sd, skew, kurtosis))[-c(1,2,3),]
+
+write.csv(reg5_test_output,'model3_new_test.csv')
+```
+
+Output 
